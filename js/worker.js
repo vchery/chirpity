@@ -27,7 +27,8 @@ let workerInstance = 0;
 // let TEMP, appPath, CACHE_LOCATION, BATCH_SIZE, LABELS, BACKEND, batchChunksToSend = {};
 let TEMP, appPath, BATCH_SIZE, LABELS, BACKEND, batchChunksToSend = {};
 let LIST_WORKER;
-const DEBUG = false;
+const DEBUG = true;
+const DEBUG2 = false;
 
 const DATASET = true;
 const adding_chirpity_additions = false;
@@ -667,7 +668,7 @@ const prepSummaryStatement = (included) => {
                 circleClicked = false
             }) {
                 // Now we've asked for a new analysis, clear the aborted flag
-                aborted = false; STATE.incrementor = 1;
+                aborted = false; 
                 predictionStart = new Date();
                 // Set the appropraite selection range if this is a selection analysis
                 STATE.update({ selection: end ? getSelectionRange(filesInScope[0], start, end) : undefined });
@@ -737,9 +738,9 @@ const prepSummaryStatement = (included) => {
                 STATE.selection || onChangeMode('analyse');
                 
                 filesBeingProcessed = [...FILE_QUEUE];
-                
-                // for (let i = 0; i < filesBeingProcessed.length; i++) {
-                for (let i = 0; i < NUM_WORKERS; i++) {
+                // use min of 500 to avoid "too many media players" error
+                for (let i = 0; i < Math.min(500, filesBeingProcessed.length); i++) {
+                //for (let i = 0; i < NUM_WORKERS; i++) {
                     processNextFile({ start: start, end: end, worker: i });
                 }
             }
@@ -1006,7 +1007,10 @@ const prepSummaryStatement = (included) => {
                         offlineSource.start();
                         return offlineCtx;
                     } )
-                    .catch( (error) => console.log(error));
+                    .catch( (error) => {
+                        console.log(error)
+                        return false
+                    });
 
                 
                 // // Create a compressor node
@@ -1325,10 +1329,9 @@ const prepSummaryStatement = (included) => {
                         updateFilesBeingProcessed(file)
                         reject(new Error('Error extracting audio segment:', error));
                     });
-                    command.on('start', function (commandLine) {
-                        DEBUG && console.log('FFmpeg command: ' + commandLine);
-                    })
-    
+
+                    DEBUG2 && command.on('start', commandLine => console.log('FFmpeg command:', commandLine));
+
                     command.on('end', () => {
                         // End the stream to signify completion
                         stream.end();
@@ -1343,20 +1346,27 @@ const prepSummaryStatement = (included) => {
                         //Add the audio header
                         data.unshift(CHIRPITY_HEADER)
                         // Concatenate the data chunks into a single Buffer
-                        const audio = Buffer.concat(data);
+                        try {
+                            const audio = Buffer.concat(data);
 
-                        // Navtive CHIRPITY_HEADER (24kHz) here for UI
-                        const offlineCtx = await setupCtx(audio, sampleRate).catch( (error) => {console.error(error.message)});
-                        if (offlineCtx){
-                            offlineCtx.startRendering().then(resampled => {
-                                // `resampled` contains an AudioBuffer resampled at 24000Hz.
-                                // use resampled.getChannelData(x) to get an Float32Array for channel x.
-                                // readStream.resume();
-                                resolve(resampled);
-                            }).catch((error) => {
-                                console.error(`FetchAudio rendering failed: ${error}`);
-                                // Note: The promise should reject when startRendering is called a second time on an OfflineAudioContext
-                            });
+                            // Navtive CHIRPITY_HEADER (24kHz) here for UI
+                            const offlineCtx = await setupCtx(audio, sampleRate).catch( (error) => {console.error(error.message)});
+                            if (offlineCtx){
+                                offlineCtx.startRendering().then(resampled => {
+                                    // `resampled` contains an AudioBuffer resampled at 24000Hz.
+                                    // use resampled.getChannelData(x) to get an Float32Array for channel x.
+                                    // readStream.resume();
+                                    resolve(resampled);
+                                }).catch((error) => {
+                                    console.error(`FetchAudio rendering failed: ${error}`);
+                                    // Note: The promise should reject when startRendering is called a second time on an OfflineAudioContext
+                                });
+                            } else {
+                                resolve(false)
+                            }
+                        } catch (error) {
+                            console.warn(error)
+                            resolve(false)
                         }
                     });
             
@@ -1549,6 +1559,7 @@ const prepSummaryStatement = (included) => {
                 }, (err) => {
                     if (err) return console.log(err);
                     Promise.all(promises).then(() => console.log(`Dataset created. ${count} files saved in ${(Date.now() - t0) / 1000} seconds`))
+                    UI.postMessage({event: 'analysis-complete'})
                 })
                 
             }
@@ -2053,7 +2064,9 @@ const prepSummaryStatement = (included) => {
                                 }
                             break;
                         }
-                        case "spectrogram": {onSpectrogram(response["filepath"], response["file"], response["width"], response["height"], response["image"], response["channels"]);
+                        case "spectrogram": {
+                            predictWorkers[response.worker].isAvailable = true;
+                            onSpectrogram(response["filepath"], response["file"], response["width"], response["height"], response["image"], response["channels"]);
                         break;
                     }
 
