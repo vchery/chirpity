@@ -29,10 +29,10 @@ let TEMP, appPath, BATCH_SIZE, LABELS, BACKEND, batchChunksToSend = {};
 let LIST_WORKER;
 const DEBUG = false;
 
-const DATASET = false;
+const DATASET = true;
 const adding_chirpity_additions = false;
 const dataset_database = DATASET;
-const DATASET_SAVE_LOCATION = "E:/DATASETS/BirdNET_pngs";
+const DATASET_SAVE_LOCATION = "E:/DATASETS/NEW_MODEL_PNGs";
 
 // Adapted from https://stackoverflow.com/questions/6117814/get-week-of-year-in-javascript-like-in-php
 Date.prototype.getWeekNumber = function(){
@@ -1474,9 +1474,11 @@ const prepSummaryStatement = (included) => {
                 JOIN species
                 ON species.id = records.speciesID
                 JOIN files ON records.fileID = files.id
-                ${filtersApplied(included) ? `WHERE speciesID IN (${prepParams(STATE.included)}` : ''}) 
-                AND confidence >= ${STATE.detect.confidence}`;
-                let params = filtersApplied(included) ? STATE.included : [];
+                WHERE confidence >= ${STATE.detect.confidence}`;
+                
+                db2ResultSQL+= filtersApplied(included) ? ` AND speciesID IN (${prepParams(STATE.included)})` : '';
+                
+                let params = filtersApplied(included) ? included : [];
                 if (species) {
                     db2ResultSQL += ` AND species.cname = ?`;
                     params.push(species)
@@ -1746,11 +1748,11 @@ const prepSummaryStatement = (included) => {
                         await parseMessage(message).catch( (error) => {
                             console.warn("Parse message error", error, 'message was', message);
                         });
-                        // Dial down the getSummary calls if the queue length starts growing
-                        // if (messageQueue.length > NUM_WORKERS * 2 )  {
-                        //     STATE.incrementor = Math.min(STATE.incrementor *= 2, 256);
-                        //     console.log('increased incrementor to ', STATE.incrementor)
-                        // }
+                        //Dial down the getSummary calls if the queue length starts growing
+                        if (messageQueue.length > NUM_WORKERS * 2 )  {
+                            STATE.incrementor = Math.min(STATE.incrementor *= 2, 256);
+                            console.log('increased incrementor to ', STATE.incrementor)
+                        }
 
                         
                         // Set isParsing to false to allow the next message to be processed
