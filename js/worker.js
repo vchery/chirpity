@@ -101,7 +101,7 @@ let workerInstance = 0;
 // let TEMP, appPath, CACHE_LOCATION, BATCH_SIZE, LABELS, BACKEND, batchChunksToSend = {};
 let TEMP, appPath, BATCH_SIZE, LABELS, BACKEND, batchChunksToSend = {};
 let LIST_WORKER;
-const DEBUG = true;
+const DEBUG = false;
 
 const DATASET = false;
 const adding_chirpity_additions = true;
@@ -1328,9 +1328,9 @@ const getPredictBuffers = async ({
     predictionsReceived[file] = 0;
     predictionsRequested[file] = 0;
     let concatenatedBuffer = Buffer.alloc(0);
-    const highWaterMark =  2 * sampleRate * BATCH_SIZE * WINDOW_SIZE; 
+    const highWaterMark =  4 * sampleRate * BATCH_SIZE * WINDOW_SIZE; 
     //const STREAM = new PassThrough({ highWaterMark: highWaterMark, end: true});
-    const STREAM = new PassThrough({end: false});
+    
 
     let chunkStart = start * sampleRate;
     return new Promise((resolve, reject) => {
@@ -1338,9 +1338,37 @@ const getPredictBuffers = async ({
             UI.postMessage({event: 'generate-alert', message: `The requested audio file cannot be found: ${file}`})
             return reject(new Error('getPredictBuffers: Error extracting audio segment: File not found.'));
         }
-        const command = ffmpeg(file)
-            .seekInput(start)
+        const STREAM = new PassThrough({end: false});
+        let command = ffmpeg(file)        
+        if (STATE.filters.sendToModel && STATE.filters.active) {
+            if (STATE.filters.lowShelfFrequency > 0){
+                command = command.audioFilters(
+                    {
+                        filter: 'lowshelf',
+                        options: `gain=${STATE.filters.lowShelfAttenuation}:f=${STATE.filters.lowShelfFrequency}`
+                    }
+                )
+            }
+            if (STATE.filters.highPassFrequency > 0){
+                command = command.audioFilters(
+                    {
+                        filter: 'highpass',
+                        options: `f=${STATE.filters.highPassFrequency}:poles=1`
+                    }
+                )
+            }
+            if (STATE.audio.normalise){
+                command = command.audioFilters(
+                    {
+                        filter: 'loudnorm',
+                        options: "I=-16:LRA=11:TP=-1.5" //:offset=" + STATE.audio.gain
+                    }
+                )
+            }
+        }
+        command.seekInput(start)
             .duration(end - start)
+            .audioCodec('pcm_f32le') // we're going to create a float32array
             .format('wav')
             .audioChannels(1) // Set to mono
             .audioFrequency(sampleRate) // Set sample rate 
@@ -1363,45 +1391,50 @@ const getPredictBuffers = async ({
                 console.log('Finished processing', file, err, stdout, stderr);
             })
         }
-        STREAM.on('readable', () => {           
+        STREAM.on('readable', (command) => {           
             if (aborted) {
                 STREAM.destroy();
                 return
             }
-            checkBacklog(STREAM).then(chunk => {
-                if (chunk === null || chunk.byteLength <= 1) {
-                    // EOF: deal with part-full buffers
-                    if (concatenatedBuffer.length){
-                        header || console.warn('no header for ' + file)
-                        const audio = isWavHeaderPresent(header, concatenatedBuffer) 
-                            ? concatenatedBuffer: Buffer.concat([header, concatenatedBuffer])
-                        predictQueue.push([audio, file, end, chunkStart]);
-                        processPredictQueue();
-                    } else {
-                        updateFilesBeingProcessed(file)
-                    }
-                    DEBUG && console.log('All chunks sent for ', file);
-                    //STREAM.end();
-                    resolve('finished')
+            const chunk = STREAM.read();
+            if (chunk === null) {
+                // EOF: deal with part-full buffers
+                if (concatenatedBuffer.length){
+                    header || console.warn('no header for ' + file)
+                    const c = concatenatedBuffer
+                    const audio = new Float32Array(c.buffer, c.byteOffset, c.length / Float32Array.BYTES_PER_ELEMENT);
+                    feedChunksToModel(audio, chunkStart, file, end);
+                    chunkStart += WINDOW_SIZE * BATCH_SIZE * sampleRate
+
+                } else {
+                    updateFilesBeingProcessed(file)
                 }
-                else {
-                    try {
-                        concatenatedBuffer = concatenatedBuffer.byteLength ? Buffer.concat([concatenatedBuffer, chunk]) : chunk;
-                        header ??= lookForHeader(concatenatedBuffer);
-                    } catch (e) {
-                        console.log('Detached buffer?', e.message);
+                DEBUG && console.log('All chunks sent for ', file);
+                resolve('finished')
+                STREAM.end();
+            }
+            else {
+                try {
+                    concatenatedBuffer = concatenatedBuffer.byteLength ? Buffer.concat([concatenatedBuffer, chunk]) : chunk;
+                    if (!header){
+                        header = lookForHeader(concatenatedBuffer);
+                        if (header ){
+                            concatenatedBuffer = concatenatedBuffer.subarray(header.length)
+                        }
                     }
-                    // if we have a full buffer
-                    if (concatenatedBuffer.length >= highWaterMark) {
-                        const chunk = concatenatedBuffer.subarray(0, highWaterMark);
-                        concatenatedBuffer = concatenatedBuffer.subarray(highWaterMark);
-                        const audio = isWavHeaderPresent(header, chunk) ? chunk: Buffer.concat([header, chunk])
-                        predictQueue.push([audio, file, end, chunkStart]);
-                        chunkStart += WINDOW_SIZE * BATCH_SIZE * sampleRate
-                        processPredictQueue();
-                    }
+                } catch (e) {
+                    console.log('Detached buffer?', e.message);
                 }
-            });
+                // if we have a full buffer
+                if (concatenatedBuffer.length >= highWaterMark) {
+                    const c = concatenatedBuffer.subarray(0, highWaterMark);
+                    concatenatedBuffer = concatenatedBuffer.subarray(highWaterMark);
+                    const audio = new Float32Array(c.buffer, c.byteOffset, c.length / Float32Array.BYTES_PER_ELEMENT);
+                    feedChunksToModel(audio, chunkStart, file, end);
+                    chunkStart += WINDOW_SIZE * BATCH_SIZE * sampleRate
+                }
+            }
+
         });
         STREAM.on('error', err => {
             console.log('stream error: ', err);
