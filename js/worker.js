@@ -945,7 +945,18 @@ const getDuration = async (src) => {
         })
     });
 }
-
+// const getDuration = async (src) => {
+//     return new Promise(function (resolve, reject) {
+//         ffmpeg.ffprobe(src, (error, metadata) => {
+//             if (error){
+//                 UI.postMessage({event: 'generate-alert', message: 'Unable to decode file metatada'})
+//                 reject(error)
+//             } else {
+//                 resolve(metadata.format.duration);
+//             }
+//         })
+//     });
+// }
 
 /**
 * getWorkingFile's purpose is to locate a file and set its metadata. 
@@ -1197,7 +1208,39 @@ function checkBacklog(stream) {
     });
 }
 
-
+function getWavMetadata(file, start, end){
+    return new Promise((resolve, reject) =>{
+        const meta = {};
+        // extract the header. With bext and iXML metadata, this can be up to 256k, hence 524288 HWM (could be optimised?)
+        const headerStream = fs.createReadStream(file, {start: 0, end: 524288, highWaterMark: 524288});
+        headerStream.on('readable',  () => {
+            let chunk = headerStream.read();
+            let wav = new wavefileReader.WaveFileReader();
+            try {
+                wav.fromBuffer(chunk);
+            } catch (e) {
+                headerStream.close();
+                updateFilesBeingProcessed(file);
+                return reject(new Error(`Cannot parse ${file}, it has an invalid wav header.`));
+            }
+            let headerEnd;
+            wav.signature.subChunks.forEach(el => {
+                if (el['chunkId'] === 'data') {
+                    headerEnd = el.chunkData.start;
+                }
+            });
+            meta.header = chunk.subarray(0, headerEnd);
+            const byteRate = wav.fmt.byteRate;
+            const sample_rate = wav.fmt.sampleRate;
+            meta.byteStart = Math.round((start * byteRate) / sample_rate) * sample_rate + headerEnd;
+            meta.byteEnd = Math.round((end * byteRate) / sample_rate) * sample_rate + headerEnd;
+            meta.highWaterMark = byteRate * BATCH_SIZE * WINDOW_SIZE;
+            headerStream.destroy();
+            DEBUG && console.log('Header extracted for ', file)
+            resolve(meta)
+        })
+    })
+}
 /**
 *
 * @param file
@@ -1211,81 +1254,52 @@ let predictQueue = [];
 const getWavePredictBuffers = async ({
     file = '', start = 0, end = undefined
 }) => {
+    if (! fs.existsSync(file)) {
+        UI.postMessage({event: 'generate-alert', message: `The requested audio file cannot be found: ${file}`})
+        return new Error('getWavePredictBuffers: Error extracting audio segment: File not found.');
+    }
     // Ensure max and min are within range
     start = Math.max(0, start);
     end = Math.min(metadata[file].duration, end);
     if (start > metadata[file].duration) {
         return
-    }
-    let meta = {};
+    }        
+    const meta = await getWavMetadata(file, start, end).catch(e => {
+        return UI.postMessage({event: 'generate-alert', message: e.message});
+    });
+    if (! meta) return;
     batchChunksToSend[file] = Math.ceil((end - start) / (BATCH_SIZE * WINDOW_SIZE));
     predictionsReceived[file] = 0;
     predictionsRequested[file] = 0;
-    let readStream;
-    if (! fs.existsSync(file)) {
-        UI.postMessage({event: 'generate-alert', message: `The requested audio file cannot be found: ${file}`})
-        return new Error('getWavePredictBuffers: Error extracting audio segment: File not found.');
-    }
-    // extract the header. With bext and iXML metadata, this can be up to 128k, hence 131072
-    const headerStream = fs.createReadStream(file, {start: 0, end: 524288, highWaterMark: 524288});
-    headerStream.on('readable',  () => {
-        let chunk = headerStream.read();
-        let wav = new wavefileReader.WaveFileReader();
-        try {
-            wav.fromBuffer(chunk);
-        } catch (e) {
-            UI.postMessage({event: 'generate-alert', message: `Cannot parse ${file}, it has an invalid wav header.`});
-            headerStream.close();
-            updateFilesBeingProcessed(file);
-            return;
+    const readStream = fs.createReadStream(file, {
+        start: meta.byteStart, end: meta.byteEnd, highWaterMark: meta.highWaterMark
+    });
+
+    let chunkStart = start * sampleRate;
+    // Changed on.('data') handler because of:  https://stackoverflow.com/questions/32978094/nodejs-streams-and-premature-end
+    readStream.on('readable', () => {
+        if (aborted) {
+            readStream.destroy();
+            return
         }
-        let headerEnd;
-        wav.signature.subChunks.forEach(el => {
-            if (el['chunkId'] === 'data') {
-                headerEnd = el.chunkData.start;
-            }
-        });
-        meta.header = chunk.subarray(0, headerEnd);
-        const byteRate = wav.fmt.byteRate;
-        const sample_rate = wav.fmt.sampleRate;
-        meta.byteStart = Math.round((start * byteRate) / sample_rate) * sample_rate + headerEnd;
-        meta.byteEnd = Math.round((end * byteRate) / sample_rate) * sample_rate + headerEnd;
-        meta.highWaterMark = byteRate * BATCH_SIZE * WINDOW_SIZE;
-        headerStream.destroy();
-        DEBUG && console.log('Header extracted for ', file)
-
-
-        readStream = fs.createReadStream(file, {
-            start: meta.byteStart, end: meta.byteEnd, highWaterMark: meta.highWaterMark
-        });
-
-    
-        let chunkStart = start * sampleRate;
-        // Changed on.('data') handler because of:  https://stackoverflow.com/questions/32978094/nodejs-streams-and-premature-end
-        readStream.on('readable', () => {
-            if (aborted) {
+        checkBacklog(readStream).then(chunk => {
+            if (chunk === null || chunk.byteLength <= 1 ) {
+                // EOF
+                chunk?.byteLength && predictionsReceived[file]++;
                 readStream.destroy();
-                return
+            } else {
+                const audio = Buffer.concat([meta.header, chunk]);
+                predictQueue.push([audio, file, end, chunkStart]);
+                chunkStart += WINDOW_SIZE * BATCH_SIZE * sampleRate;
+                processPredictQueue();
             }
+        })
+    })
+    readStream.on('error', err => {
+        console.log(`readstream error: ${err}, start: ${start}, , end: ${end}, duration: ${metadata[file].duration}`);
+        err.code === 'ENOENT' && notifyMissingFile(file);
+    })
 
-            checkBacklog(readStream).then(chunk => {
-                if (chunk === null || chunk.byteLength <= 1 ) {
-                    // EOF
-                    chunk?.byteLength && predictionsReceived[file]++;
-                    readStream.destroy();
-                } else {
-                    const audio = Buffer.concat([meta.header, chunk]);
-                    predictQueue.push([audio, file, end, chunkStart]);
-                    chunkStart += WINDOW_SIZE * BATCH_SIZE * sampleRate;
-                    processPredictQueue();
-                }
-            })
-        })
-        readStream.on('error', err => {
-            console.log(`readstream error: ${err}, start: ${start}, , end: ${end}, duration: ${metadata[file].duration}`);
-            err.code === 'ENOENT' && notifyMissingFile(file);
-        })
-    })    
 }
 
 function processPredictQueue(){
@@ -1295,9 +1309,7 @@ function processPredictQueue(){
         if (offlineCtx) {
             offlineCtx.startRendering().then((resampled) => {
                 const myArray = resampled.getChannelData(0);
-                workerInstance = ++workerInstance >= NUM_WORKERS ? 0 : workerInstance;
-                worker = workerInstance;
-                feedChunksToModel(myArray, chunkStart, file, end, worker);
+                feedChunksToModel(myArray, chunkStart, file, end);
                 return
             }).catch((error) => {
                 console.error(`PredictBuffer rendering failed: ${error}, file ${file}`);
@@ -1307,8 +1319,6 @@ function processPredictQueue(){
         } else {
             console.log('Short chunk', audio.length, 'padding');
             let chunkLength = STATE.model === 'birdnet' ? 144_000 : 72_000;
-            workerInstance = ++workerInstance >= NUM_WORKERS ? 0 : workerInstance;
-            worker = workerInstance;
             const myArray = new Float32Array(Array.from({ length: chunkLength }).fill(0));
             feedChunksToModel(myArray, chunkStart, file, end);
         }}).catch(error => { console.warn(file, error) })
@@ -1325,13 +1335,11 @@ const getPredictBuffers = async ({
     }
     let header;
     batchChunksToSend[file] = Math.ceil((end - start) / (BATCH_SIZE * WINDOW_SIZE));
+    let sentBatches = 0;
     predictionsReceived[file] = 0;
     predictionsRequested[file] = 0;
     let concatenatedBuffer = Buffer.alloc(0);
     const highWaterMark =  4 * sampleRate * BATCH_SIZE * WINDOW_SIZE; 
-    //const STREAM = new PassThrough({ highWaterMark: highWaterMark, end: true});
-    
-
     let chunkStart = start * sampleRate;
     return new Promise((resolve, reject) => {
         if (! fs.existsSync(file)) {
@@ -1391,7 +1399,7 @@ const getPredictBuffers = async ({
                 console.log('Finished processing', file, err, stdout, stderr);
             })
         }
-        STREAM.on('readable', (command) => {           
+        STREAM.on('readable', () => {           
             if (aborted) {
                 STREAM.destroy();
                 return
@@ -1403,7 +1411,13 @@ const getPredictBuffers = async ({
                     header || console.warn('no header for ' + file)
                     const c = concatenatedBuffer
                     const audio = new Float32Array(c.buffer, c.byteOffset, c.length / Float32Array.BYTES_PER_ELEMENT);
+                    sentBatches++
                     feedChunksToModel(audio, chunkStart, file, end);
+                    // Did we send all the expected batches for this file?
+                    if (sentBatches !== batchChunksToSend[file]){
+                        UI.postMessage({event: 'generate-alert', message: `Did not read all of ${file}: Expected ${batchChunksToSend[file]}, but <b><font color="red">${sentBatches}</font></b> were sent. `})
+                    }
+
                     chunkStart += WINDOW_SIZE * BATCH_SIZE * sampleRate
 
                 } else {
@@ -1411,7 +1425,7 @@ const getPredictBuffers = async ({
                 }
                 DEBUG && console.log('All chunks sent for ', file);
                 resolve('finished')
-                STREAM.end();
+                //STREAM.end();
             }
             else {
                 try {
@@ -1431,6 +1445,7 @@ const getPredictBuffers = async ({
                     concatenatedBuffer = concatenatedBuffer.subarray(highWaterMark);
                     const audio = new Float32Array(c.buffer, c.byteOffset, c.length / Float32Array.BYTES_PER_ELEMENT);
                     feedChunksToModel(audio, chunkStart, file, end);
+                    sentBatches++;
                     chunkStart += WINDOW_SIZE * BATCH_SIZE * sampleRate
                 }
             }
@@ -1444,6 +1459,10 @@ const getPredictBuffers = async ({
     }).catch(error => console.log(error));
 }
 
+function pickWorker(){
+        workerInstance = ++workerInstance >= NUM_WORKERS ? 0 : workerInstance;
+        return workerInstance;
+}
 function lookForHeader(buffer){
     //if (buffer.length < 4096) return undefined
     try {
@@ -1550,12 +1569,9 @@ function isDuringDaylight(datetime, lat, lon) {
     return datetime >= dawn && datetime <= dusk;
 }
 
-async function feedChunksToModel(channelData, chunkStart, file, end, worker) {
+async function feedChunksToModel(channelData, chunkStart, file, end) {
+    const worker = pickWorker();
     predictionsRequested[file]++;
-    if (worker === undefined) {
-        // pick a worker - this method is faster than looking for avialable workers
-        worker = ++workerInstance >= NUM_WORKERS ? 0 : workerInstance
-    }
     const objData = {
         message: 'predict',
         worker: worker,
@@ -1791,8 +1807,8 @@ const bufferToAudio = async ({
         // Static binary is missing the aac encoder
         // } else if (format === 'm4a') {
         //     audioCodec = 'aac';
-        //     soundFormat = 'aac';
-        //     mimeType = 'audio/mp4'
+        //     soundFormat = 'mp4';
+        //     mimeType = 'audio/mpeg'
     } else if (format === 'opus') {
         audioCodec = 'libopus';
         soundFormat = 'opus'
@@ -2132,7 +2148,7 @@ const parsePredictions = async (response) => {
     let file = response.file;
     const included = await getIncludedIDs(file).catch( (error) => console.log('Error getting included IDs', error));
     const latestResult = response.result, db = STATE.db;
-    DEBUG && console.log('worker being used:', response.worker);
+    //DEBUG && console.log('worker being used:', response.worker);
     if (! STATE.selection) await generateInsertQuery(latestResult, file).catch( (error) => console.log('Error generating insert query', error));
     let [keysArray, speciesIDBatch, confidenceBatch] = latestResult;
     for (let i = 0; i < keysArray.length; i++) {
