@@ -1153,6 +1153,15 @@ exploreLink.addEventListener('click', async () => {
     resetResults({clearSummary: true, clearPagination: true, clearResults: true});
 });
 
+const restoreLink = document.getElementById('restore');
+restoreLink.addEventListener('click', async () => {
+    // Todo: Placeholder for results restore
+    worker.postMessage({ action: 'change-mode', mode: 'analyse' });
+    hideAll();
+    showElement(['spectrogramWrapper', 'resultTableContainer', 'fullscreen']);
+    worker.postMessage({ action: 'filter', updateSummary: true });
+});
+
 // const datasetLink = document.getElementById('dataset');
 // datasetLink.addEventListener('click', async () => {
 //     worker.postMessage({ action: 'create-dataset', species: isSpeciesViewFiltered(true) });
@@ -1497,14 +1506,15 @@ window.onload = async () => {
         useWeek: false,
         model: 'chirpity',
         chirpity: {locale: 'en_uk'},
-        birdnet: {locale: 'en_uk'},
+        birdnet: {locale: 'en'},
         latitude: 52.87,
         longitude: 0.89, 
         location: 'Great Snoring, North Norfolk',
         detect: { nocmig: false, contextAware: false, confidence: 45 },
         filters: { active: false, highPassFrequency: 0, lowShelfFrequency: 0, lowShelfAttenuation: 0, SNR: 0, sendToModel: false },
         warmup: true,
-        backend: 'tensorflow',
+        backend: 'webgpu',
+        hasNode: false,
         tensorflow: { threads: DIAGNOSTICS['Cores'], batchSize: 32 },
         webgpu: { threads: 2, batchSize: 4 },
         webgl: { threads: 2, batchSize: 32 },
@@ -1603,28 +1613,7 @@ window.onload = async () => {
         DOM.audioFade.disabled = !DOM.audioPadding.checked;
         DOM.audioDownmix.checked = config.audio.downmix;
         setNocmig(config.detect.nocmig);
-        const chirpityOnly = document.querySelectorAll('.chirpity-only');
-        const noMac = document.querySelectorAll('.no-mac');
-        if (config.model === 'birdnet'){
-            // hide chirpity-only features
-            chirpityOnly.forEach(element => element.classList.add('d-none'));
-            if (config.list === 'nocturnal')  {
-                DOM.localSwitchContainer.classList.remove('d-none');
-            }
-            DOM.contextAware.checked = false;
-            DOM.contextAware.disabed = true;
-            config.detect.contextAware = false;
-            SNRSlider.disabled = true;
-            config.filters.SNR = 0;
-        } else {
-            // show chirpity-only features
-            chirpityOnly.forEach(element => element.classList.remove('d-none'));
-            // Remove GPU option on Mac
-            isMac && noMac.forEach(element => element.classList.add('d-none'));
-            DOM.contextAware.checked = config.detect.contextAware;
-            DOM.localSwitchContainer.classList.add('d-none');
-            SNRSlider.disabled = false;
-        }
+        modelSettingsDisplay();
         contextAwareIconDisplay();
         DOM.debugMode.checked = config.debug;
         showThreshold(config.detect.confidence);
@@ -1795,12 +1784,30 @@ const setUpWorkerMessaging = () => {
                 case 'ready-for-tour':{
                     // New users - show the tour
                     if (!config.seenTour) {
+                        config.seenTour = true;
                         setTimeout(prepTour, 1500);
                     }
                     break;
                 }
                 case "seen-species-list": {generateBirdList("seenSpecies", args.list);
                 break;
+                }
+                case 'tfjs-node': {
+                    // Have we gone from a no-node setting to a node one?
+                    const changedEnv = config.hasNode !== args.hasNode;
+                    if (changedEnv && args.hasNode) {
+                        // Let's switch to the tensorflow backend because this is generally faster under Node
+                        handleBackendChange('tensorflow');
+                    }
+                    config.hasNode = args.hasNode;
+                    if (!config.hasNode && config.backend !== 'webgpu'){
+                        // No node? Not using webgpu? Force webgpu
+                        handleBackendChange('webgpu');
+                        generateToast({ message: 'The standard backend could not be loaded on this machine. An experimental backend (webGPU) has been used instead.'});
+                        console.warn('tfjs-node could not be loaded, webGPU backend forced. CPU is', DIAGNOSTICS['CPU'])
+                    }
+                    modelSettingsDisplay();
+                    break;
                 }
                 case "valid-species-list": {populateSpeciesModal(args.included, args.excluded);
                     break;
@@ -2417,7 +2424,7 @@ function onChartData(args) {
     
     const handleBackendChange = (backend) => {
         config.backend = backend instanceof Event ? backend.target.value : backend;
-        if (config.backend === 'webgl') {
+        if (config.backend === 'webgl' || config.backend === 'webgpu') {
             //powerSave(true)
             SNRSlider.disabled = true;
             config.filters.SNR = 0;
@@ -2815,7 +2822,6 @@ function onChartData(args) {
         if (region) enableMenuItem(['analyseSelection'])
         t1_warmup = Date.now();
         DIAGNOSTICS['Warm Up'] = ((t1_warmup - t0_warmup) / 1000).toFixed(2) + ' seconds';
-        
     }
     
     
@@ -3599,7 +3605,38 @@ function onChartData(args) {
             range: range
         })
     }
-    
+    const modelSettingsDisplay = () => {
+        const chirpityOnly = document.querySelectorAll('.chirpity-only');
+        const noMac = document.querySelectorAll('.no-mac');
+        const nodeOnly = document.querySelectorAll('.node-only');
+        if (config.model === 'birdnet'){
+            // hide chirpity-only features
+            chirpityOnly.forEach(element => element.classList.add('d-none'));
+            if (config.list === 'nocturnal')  {
+                DOM.localSwitchContainer.classList.remove('d-none');
+            }
+            DOM.contextAware.checked = false;
+            DOM.contextAware.disabed = true;
+            config.detect.contextAware = false;
+            SNRSlider.disabled = true;
+            config.filters.SNR = 0;
+        } else {
+            // show chirpity-only features
+            chirpityOnly.forEach(element => element.classList.remove('d-none'));
+            // Remove GPU option on Mac
+            isMac && noMac.forEach(element => element.classList.add('d-none'));
+            DOM.contextAware.checked = config.detect.contextAware;
+            DOM.localSwitchContainer.classList.add('d-none');
+            SNRSlider.disabled = false;
+            if (config.hasNode){
+                nodeOnly.forEach(element => element.classList.remove('d-none'));
+            } else {
+                nodeOnly.forEach(element => element.classList.add('d-none'));
+            }
+        }
+
+    }
+
     const contextAwareIconDisplay = () => {
         if (config.detect.contextAware) {
             DOM.contextAwareIcon.classList.add('text-warning');
@@ -4389,29 +4426,12 @@ DOM.gain.addEventListener('input', () => {
                 }
                 case 'model-to-use': {
                     config.model = element.value;
-                    const chirpityOnly = document.querySelectorAll('.chirpity-only');
-                    if (config.model === 'birdnet') { 
-                        DOM.contextAware.checked = false;
-                        if (config.list === 'nocturnal') document.getElementById('use-location-container').classList.remove('d-none')
-                        // hide chirpity-only features
-                        chirpityOnly.forEach(element => element.classList.add('d-none'));
-                        DOM.contextAware.disabed = true;
-                        config.detect.contextAware = false;
-                        SNRSlider.disabled = true;
-                        config.filters.SNR = 0;
-                        
-                    } else {
-                        // show chirpity-only features
-                        chirpityOnly.forEach(element => element.classList.remove('d-none'));
-                        document.getElementById('use-location-container').classList.add('d-none');
-                        DOM.contextAware.disabed = false;
-                        SNRSlider.disabled = false;
-                    }
+                    modelSettingsDisplay();
                     DOM.customListFile.value = config.customListFile[config.model];
                     DOM.customListFile.value ? LIST_MAP.custom = 'Using a custom list' : delete LIST_MAP.custom;
                     document.getElementById('locale').value = config[config.model].locale;
-                    config.backend = 'tensorflow';
-                    document.getElementById('tensorflow').checked = true;
+                    config.backend = config.hasNode ? 'tensorflow' : 'webgpu';
+                    document.getElementById(config.backend).checked = true;
                     handleBackendChange(config.backend);
                     setListUIState(config.list)
                     break;
