@@ -1,7 +1,9 @@
 const { app, Menu, dialog, ipcMain, MessageChannelMain, BrowserWindow, globalShortcut } = require('electron');
 app.commandLine.appendSwitch('disable-renderer-backgrounding');
-app.commandLine.appendSwitch('enable-unsafe-webgpu');
-app.commandLine.appendSwitch('enable-features','Vulkan');
+if (process.platform === 'linux'){
+    app.commandLine.appendSwitch('enable-unsafe-webgpu');
+    app.commandLine.appendSwitch('enable-features','Vulkan');
+}
 const { autoUpdater } = require("electron-updater");
 const log = require('electron-log');
 
